@@ -176,6 +176,39 @@ class VideoCompose(BaseTool):
                 "properties": {
                     "subtitle_burn": {"type": "boolean", "default": True},
                     "two_pass_encode": {"type": "boolean", "default": False},
+                    "width": {
+                        "type": "integer",
+                        "description": (
+                            "Output width in pixels (Remotion --width). Overrides "
+                            "media profile dimensions when set together with height. "
+                            "Use 1280 for a fast 720p preview instead of 1080p."
+                        ),
+                    },
+                    "height": {
+                        "type": "integer",
+                        "description": "Output height in pixels (Remotion --height). See width.",
+                    },
+                    "concurrency": {
+                        "type": "integer",
+                        "description": (
+                            "Remotion --concurrency: number of parallel frame "
+                            "workers. Raise on capable hardware for faster renders; "
+                            "set to 1 when RAM-constrained."
+                        ),
+                    },
+                    "quality": {
+                        "type": "integer",
+                        "description": "Remotion --quality: JPEG quality of rendered frames (1-100). Lower = faster preview.",
+                    },
+                    "render_timeout": {
+                        "type": "integer",
+                        "default": 900,
+                        "description": (
+                            "Seconds before the Remotion render is killed. Default "
+                            "900 (was a hard-coded 600 that killed slow 1080p renders). "
+                            "Pass a smaller value for short previews to fail fast."
+                        ),
+                    },
                 },
             },
             "codec": {"type": "string", "default": "libx264"},
@@ -338,6 +371,95 @@ class VideoCompose(BaseTool):
         return path.suffix.lower() in VideoCompose._IMAGE_EXTENSIONS
 
     @staticmethod
+    def _ff(bin_name: str) -> str:
+        """Resolve ffmpeg/ffprobe to a runnable executable path.
+
+        Pipelines often stage ffmpeg/ffprobe in the project virtualenv
+        (`.venv/Scripts` on Windows) WITHOUT adding them to the global PATH.
+        A bare ``subprocess.run(["ffprobe", ...])`` then raises
+        FileNotFoundError on such machines, which is why the final-review
+        audio probe silently reported "ffprobe not found" and never detected
+        narration. ``run_command`` already resolves via shutil.which, but the
+        direct subprocess calls below bypass it, so they route through here:
+        PATH first (shutil.which), then the running interpreter's own bin
+        directory (the venv Scripts folder), then fall back to the bare name.
+        """
+        import shutil as _shutil
+        import sys
+
+        is_win = sys.platform.startswith("win")
+        found = _shutil.which(bin_name)
+        if not found and is_win:
+            found = _shutil.which(bin_name + ".exe")
+        if found:
+            return found
+        candidate = Path(sys.executable).parent / (bin_name + (".exe" if is_win else ""))
+        if candidate.exists():
+            return str(candidate)
+        return bin_name
+
+    @staticmethod
+    def _measure_audio_levels(
+        media_path: str,
+    ) -> tuple[Optional[float], Optional[float]]:
+        """Decode audio to mono PCM and compute (mean_dbfs, peak_dbfs).
+
+        Works with any ffmpeg build that can decode the audio and encode
+        pcm_s16le into a wav — true even for heavily-stripped static builds
+        like the one Remotion bundles, which lacks volumedetect/astats and
+        can't encode to the null muxer. Returns (None, None) if the audio
+        can't be decoded. This is the fallback that makes narration detection
+        reliable across minimal ffmpeg builds.
+        """
+        import array
+        import math
+        import tempfile
+
+        ff = VideoCompose._ff("ffmpeg")
+        with tempfile.TemporaryDirectory() as td:
+            wav = Path(td) / "level.wav"
+            cmd = [
+                ff, "-y", "-i", str(media_path),
+                "-vn", "-ac", "1", "-ar", "16000",
+                "-c:a", "pcm_s16le", str(wav),
+            ]
+            try:
+                subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            except Exception:
+                return (None, None)
+            if not wav.exists():
+                return (None, None)
+            try:
+                import wave
+
+                with wave.open(str(wav), "rb") as w:
+                    raw = w.readframes(w.getnframes())
+                    sample_width = w.getsampwidth()
+            except Exception:
+                return (None, None)
+
+            if sample_width != 2 or not raw:
+                return (None, None)
+            samples = array.array("h", raw)
+            n = len(samples)
+            if n == 0:
+                return (None, None)
+
+            peak = 0
+            sq_sum = 0
+            for s in samples:
+                v = s if s >= 0 else -s
+                if v > peak:
+                    peak = v
+                sq_sum += s * s
+
+            rms = math.sqrt(sq_sum / n)
+            max_amp = 32767.0
+            mean_db = 20 * math.log10(rms / max_amp) if rms > 0 else -120.0
+            peak_db = 20 * math.log10(peak / max_amp) if peak > 0 else -120.0
+            return (round(mean_db, 1), round(peak_db, 1))
+
+    @staticmethod
     def _has_audio_stream(path: Path) -> bool:
         """Return True iff ffprobe reports at least one audio stream.
 
@@ -350,7 +472,7 @@ class VideoCompose(BaseTool):
         try:
             out = subprocess.check_output(
                 [
-                    "ffprobe", "-v", "error",
+                    VideoCompose._ff("ffprobe"), "-v", "error",
                     "-select_streams", "a",
                     "-show_entries", "stream=codec_type",
                     "-of", "default=nw=1:nk=1",
@@ -1276,6 +1398,40 @@ class VideoCompose(BaseTool):
 
         return render_result
 
+    @staticmethod
+    def _stage_local_asset(src_path: Path, composer_dir: Path) -> str:
+        """Copy a local asset into remotion-composer/public/ and return its
+        static-relative path (usable by Remotion's staticFile()).
+
+        Remotion can only read local files that live under public/. Files are
+        bucketed under public/openmontage/<hash>/<basename> where <hash> is
+        derived from the absolute source path, so distinct projects that share
+        a basename (e.g. two narration.wav files) don't clobber each other.
+        Re-staging an unchanged source is a no-op (idempotent) and skips the
+        copy when the staged copy is already up to date.
+        """
+        import hashlib
+        import shutil as _shutil
+
+        public_dir = composer_dir / "public" / "openmontage"
+        digest = hashlib.sha1(
+            str(src_path.resolve()).encode("utf-8")
+        ).hexdigest()[:10]
+        bucket = public_dir / digest
+        bucket.mkdir(parents=True, exist_ok=True)
+        dest = bucket / src_path.name
+
+        src_stat = src_path.stat()
+        need_copy = (
+            not dest.exists()
+            or dest.stat().st_size != src_stat.st_size
+            or dest.stat().st_mtime < src_stat.st_mtime
+        )
+        if need_copy:
+            _shutil.copy2(src_path, dest)
+
+        return f"openmontage/{digest}/{src_path.name}"
+
     def _remotion_render(self, inputs: dict[str, Any]) -> ToolResult:
         """Render via Remotion (requires Node.js + npx).
 
@@ -1306,15 +1462,64 @@ class VideoCompose(BaseTool):
         # Deep-copy props so we don't mutate the original
         props = json.loads(json.dumps(composition_data))
 
-        # Convert absolute file paths to file:// URIs for Remotion's
-        # Img and OffthreadVideo components
+        options = inputs.get("options", {}) or {}
+
+        # remotion-composer lives at project root
+        composer_dir = Path(__file__).resolve().parent.parent.parent / "remotion-composer"
+        if not composer_dir.exists():
+            return ToolResult(
+                success=False,
+                error=f"Remotion composer project not found at {composer_dir}",
+            )
+
+        # Stage local asset files into remotion-composer/public/ and rewrite
+        # their references to static-relative paths. Remotion's headless asset
+        # fetcher (used by <Img>, <OffthreadVideo>, <Audio>) can only download
+        # http(s) URLs or read files inside public/ via staticFile() — it
+        # REJECTS absolute file:// paths at render time with "Can only
+        # download URLs starting with http:// or https://". So any absolute
+        # local path (Windows drive or Unix root) MUST be staged under public/
+        # first. Do NOT emit file:/// URIs for real local assets.
+        staged: dict[str, str] = {}
+
+        def _stage_ref(src: str) -> str:
+            """Rewrite one asset reference to a static-relative path if local."""
+            if not src or src in staged:
+                return src
+            if src.startswith(("http://", "https://", "data:", "blob:")):
+                staged[src] = src
+                return src
+            clean = src.replace("\\", "/")
+            looks_absolute = clean.startswith("/") or (
+                len(clean) >= 2 and clean[1] == ":"
+            )
+            if not looks_absolute:
+                # Already a public-relative path (no leading slash, no drive) —
+                # Remotion's staticFile() will resolve it directly. Leave as-is.
+                staged[src] = src
+                return src
+            resolved = Path(src).resolve()
+            if not resolved.exists():
+                # Can't stage a missing file — leave the ref so the original
+                # path surfaces in Remotion's error instead of being masked.
+                staged[src] = src
+                return src
+            rel = VideoCompose._stage_local_asset(resolved, composer_dir)
+            staged[src] = rel
+            return rel
+
         for cut in props.get("cuts", []):
-            source = cut.get("source", "")
-            if source and not source.startswith(("http://", "https://", "file://")):
-                resolved = Path(source).resolve()
-                if resolved.exists():
-                    posix = resolved.as_posix()
-                    cut["source"] = f"file:///{posix}" if not posix.startswith("/") else f"file://{posix}"
+            if cut.get("source"):
+                cut["source"] = _stage_ref(cut["source"])
+
+        audio = props.get("audio") or {}
+        for layer in ("narration", "music"):
+            lyr = audio.get(layer) or {}
+            if lyr.get("src"):
+                lyr["src"] = _stage_ref(lyr["src"])
+            audio[layer] = lyr
+        if audio:
+            props["audio"] = audio
 
         # Build a custom themeConfig from the playbook's actual colors.
         # This ensures every video gets a unique visual identity derived
@@ -1334,14 +1539,6 @@ class VideoCompose(BaseTool):
         with open(props_path, "w", encoding="utf-8") as f:
             json.dump(props, f)
 
-        # remotion-composer lives at project root
-        composer_dir = Path(__file__).resolve().parent.parent.parent / "remotion-composer"
-        if not composer_dir.exists():
-            return ToolResult(
-                success=False,
-                error=f"Remotion composer project not found at {composer_dir}",
-            )
-
         # Route to the correct Remotion composition based on renderer_family.
         # This prevents all pipelines from collapsing into the Explainer visual grammar.
         renderer_family = (composition_data or {}).get("renderer_family", "explainer-data")
@@ -1355,9 +1552,14 @@ class VideoCompose(BaseTool):
             "--props", str(props_path),
         ]
 
-        # Apply media profile dimensions
+        # Resolution: explicit options.width/height win, else media profile,
+        # else the composition's intrinsic dimensions (no flag sent).
         profile_name = inputs.get("profile")
-        if profile_name:
+        width = options.get("width")
+        height = options.get("height")
+        if width and height:
+            cmd.extend(["--width", str(int(width)), "--height", str(int(height))])
+        elif profile_name:
             try:
                 from lib.media_profiles import get_profile
                 p = get_profile(profile_name)
@@ -1365,12 +1567,30 @@ class VideoCompose(BaseTool):
             except (ImportError, ValueError):
                 pass
 
+        # Concurrency: more parallel frame workers = faster render (costs RAM).
+        # Callers set this per-machine — raise on capable hardware, set to 1
+        # when RAM-constrained. Remotion picks its own default when omitted.
+        concurrency = options.get("concurrency")
+        if concurrency:
+            cmd.extend(["--concurrency", str(int(concurrency))])
+
+        # JPEG quality of Chrome-rendered frames (1-100). Lower is faster and
+        # is the cheapest lever for fast preview renders.
+        quality = options.get("quality")
+        if quality:
+            cmd.extend(["--quality", str(int(quality))])
+
+        # Render timeout. The previous hard-coded 600s killed 1080p renders on
+        # slower machines mid-render; default to 900s and let callers override
+        # (e.g. a short 720p preview can pass a smaller value to fail fast).
+        render_timeout = int(options.get("render_timeout", 900))
+
         try:
             # Invoke from inside the composer dir so npx can resolve the
             # local remotion binary via node_modules/.bin. Without this,
             # Windows npx cannot locate the CLI and returns "could not
             # determine executable to run".
-            self.run_command(cmd, timeout=600, cwd=composer_dir)
+            self.run_command(cmd, timeout=render_timeout, cwd=composer_dir)
         except Exception as e:
             return ToolResult(success=False, error=f"Remotion render failed: {e}")
         finally:
@@ -1573,7 +1793,7 @@ class VideoCompose(BaseTool):
         }
         try:
             cmd = [
-                "ffprobe", "-v", "quiet", "-print_format", "json",
+                VideoCompose._ff("ffprobe"), "-v", "quiet", "-print_format", "json",
                 "-show_format", "-show_streams", str(output_path),
             ]
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -1666,7 +1886,7 @@ class VideoCompose(BaseTool):
                     ts = round(duration * pct, 2)
                     frame_path = frame_dir / f"review_frame_{i}.png"
                     cmd = [
-                        "ffmpeg", "-y", "-ss", str(ts),
+                        VideoCompose._ff("ffmpeg"), "-y", "-ss", str(ts),
                         "-i", str(output_path),
                         "-frames:v", "1", "-q:v", "2",
                         str(frame_path),
@@ -1706,19 +1926,23 @@ class VideoCompose(BaseTool):
             "issues": [],
         }
         if technical_probe.get("has_audio") and duration > 0:
+            mean_vol = None
+            max_vol = None
+            audio_method = None
             try:
-                # Use ffmpeg volumedetect to check audio levels
+                # Primary: volumedetect filter (mean/max volume in dB).
+                # Some minimal/static FFmpeg builds ship WITHOUT volumedetect
+                # (e.g. the Remotion-bundled ffmpeg). In that case it prints no
+                # mean_volume/max_volume lines, mean_vol stays None, and we
+                # fall through to the astats fallback below.
                 cmd = [
-                    "ffmpeg", "-i", str(output_path),
+                    VideoCompose._ff("ffmpeg"), "-i", str(output_path),
                     "-af", "volumedetect", "-f", "null", "-",
                 ]
                 proc = subprocess.run(
                     cmd, capture_output=True, text=True, timeout=60
                 )
                 stderr = proc.stderr or ""
-                # Parse mean_volume and max_volume
-                mean_vol = None
-                max_vol = None
                 for line in stderr.split("\n"):
                     if "mean_volume:" in line:
                         try:
@@ -1730,8 +1954,28 @@ class VideoCompose(BaseTool):
                             max_vol = float(line.split("max_volume:")[1].strip().split()[0])
                         except (ValueError, IndexError):
                             pass
+                if mean_vol is not None:
+                    audio_method = "volumedetect"
+
+                # Fallback: many bundled/static ffmpeg builds ship with a
+                # stripped filter set (no volumedetect, no astats) AND can't
+                # encode to the null muxer, so filter-based level measurement
+                # is impossible. But even minimal builds can DECODE audio to
+                # raw PCM — so decode to a temp mono WAV and compute RMS/peak
+                # in Python. This is the universally-available path and works
+                # on the Remotion-bundled ffmpeg that broke the audio check.
+                if mean_vol is None:
+                    mean_db, peak_db = VideoCompose._measure_audio_levels(
+                        str(output_path)
+                    )
+                    if mean_db is not None:
+                        mean_vol = mean_db
+                        audio_method = "pcmwav"
+                    if peak_db is not None:
+                        max_vol = peak_db
 
                 if mean_vol is not None:
+                    audio_spotcheck["level_method"] = audio_method
                     if mean_vol < -60:
                         audio_spotcheck["unexpected_silence"] = True
                         audio_spotcheck["issues"].append(
@@ -1743,6 +1987,11 @@ class VideoCompose(BaseTool):
                     # Assume music present if audio exists (conservative)
                     if mean_vol > -50:
                         audio_spotcheck["music_present"] = True
+                else:
+                    audio_spotcheck["issues"].append(
+                        "Could not measure audio levels (volumedetect and astats "
+                        "both unavailable or produced no output)"
+                    )
 
                 if max_vol is not None and max_vol > -0.5:
                     audio_spotcheck["clipping_detected"] = True
@@ -1863,7 +2112,7 @@ class VideoCompose(BaseTool):
             if technical_probe.get("valid_container"):
                 try:
                     cmd = [
-                        "ffprobe", "-v", "quiet", "-print_format", "json",
+                        VideoCompose._ff("ffprobe"), "-v", "quiet", "-print_format", "json",
                         "-show_streams", "-select_streams", "s",
                         str(output_path),
                     ]

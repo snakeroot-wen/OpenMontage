@@ -127,6 +127,16 @@ GENERIC_HD = MediaProfile(
     notes="Generic HD output (no platform-specific constraints)",
 )
 
+TWITTER_LANDSCAPE = MediaProfile(
+    name="twitter_landscape",
+    width=1280, height=720,
+    aspect_ratio=AspectRatio.LANDSCAPE_16_9,
+    fps=30, codec="libx264", audio_codec="aac", crf=23,
+    caption_format="srt",
+    notes="Twitter/X landscape (1280x720). Also the recommended fast-preview "
+          "profile — half the pixels of 1080p so Remotion renders roughly 2x faster.",
+)
+
 
 # ---- Profile registry ----
 
@@ -135,6 +145,7 @@ ALL_PROFILES: dict[str, MediaProfile] = {
         YOUTUBE_LANDSCAPE, YOUTUBE_4K, YOUTUBE_SHORTS,
         INSTAGRAM_REELS, INSTAGRAM_FEED,
         TIKTOK, LINKEDIN, CINEMATIC, GENERIC_HD,
+        TWITTER_LANDSCAPE,
     ]
 }
 

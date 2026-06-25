@@ -16,8 +16,15 @@ export interface WordCaption {
 
 interface CaptionOverlayProps {
   words: WordCaption[];
-  // How many words to show at once in a "page"
+  // How many words to show at once in a "page" (item-count cap).
   wordsPerPage?: number;
+  // Soft character budget per page. A page breaks before adding a word that
+  // would push its total characters past this limit. Essential for CJK:
+  // Chinese caption items are often whole phrases, so paging purely by item
+  // count (6 phrases) produces oversized subtitle blocks that obscure the
+  // scene. Counting characters keeps both Latin word-lists and CJK phrases
+  // tidy. Set very high to effectively disable and rely on wordsPerPage only.
+  maxCharsPerPage?: number;
   fontSize?: number;
   color?: string;
   highlightColor?: string;
@@ -31,15 +38,37 @@ interface CaptionPage {
   endMs: number;
 }
 
-function buildPages(words: WordCaption[], wordsPerPage: number): CaptionPage[] {
+function buildPages(
+  words: WordCaption[],
+  wordsPerPage: number,
+  maxCharsPerPage: number,
+): CaptionPage[] {
   const pages: CaptionPage[] = [];
-  for (let i = 0; i < words.length; i += wordsPerPage) {
-    const pageWords = words.slice(i, i + wordsPerPage);
-    if (pageWords.length === 0) continue;
+  let page: WordCaption[] = [];
+  let pageChars = 0;
+  for (const w of words) {
+    // +1 accounts for the inter-word separator added at render time.
+    const wChars = w.word.length + 1;
+    const wouldExceed =
+      page.length >= wordsPerPage ||
+      (page.length > 0 && pageChars + wChars > maxCharsPerPage);
+    if (wouldExceed) {
+      pages.push({
+        words: page,
+        startMs: page[0].startMs,
+        endMs: page[page.length - 1].endMs,
+      });
+      page = [];
+      pageChars = 0;
+    }
+    page.push(w);
+    pageChars += wChars;
+  }
+  if (page.length > 0) {
     pages.push({
-      words: pageWords,
-      startMs: pageWords[0].startMs,
-      endMs: pageWords[pageWords.length - 1].endMs,
+      words: page,
+      startMs: page[0].startMs,
+      endMs: page[page.length - 1].endMs,
     });
   }
   return pages;
@@ -120,6 +149,7 @@ const PageRenderer: React.FC<{
 export const CaptionOverlay: React.FC<CaptionOverlayProps> = ({
   words,
   wordsPerPage = 6,
+  maxCharsPerPage = 24,
   fontSize = 42,
   color = "#F8FAFC",
   highlightColor = "#22D3EE",
@@ -127,7 +157,7 @@ export const CaptionOverlay: React.FC<CaptionOverlayProps> = ({
   fontFamily = "Space Grotesk, Inter, system-ui, sans-serif",
 }) => {
   const { fps } = useVideoConfig();
-  const pages = buildPages(words, wordsPerPage);
+  const pages = buildPages(words, wordsPerPage, maxCharsPerPage);
 
   return (
     <AbsoluteFill>

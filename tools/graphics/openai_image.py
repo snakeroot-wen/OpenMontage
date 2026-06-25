@@ -1,4 +1,4 @@
-"""OpenAI GPT Image generation (gpt-image-1 / DALL-E 3)."""
+"""OpenAI-compatible GPT Image generation (gpt-image-2 / gpt-image-1 / DALL-E 3)."""
 
 from __future__ import annotations
 
@@ -60,8 +60,14 @@ class OpenAIImage(BaseTool):
             "prompt": {"type": "string"},
             "model": {
                 "type": "string",
-                "enum": ["gpt-image-1", "dall-e-3"],
-                "default": "gpt-image-1",
+                "default": "gpt-image-2",
+                "description": (
+                    "Image model id. If omitted, falls back to the "
+                    "OPENAI_IMAGE_MODEL env var, then gpt-image-2. Native "
+                    "OpenAI/OpenAI-compatible: gpt-image-2, gpt-image-1.5, "
+                    "gpt-image-1, gpt-image-1-mini, dall-e-3. Some relays may "
+                    "also expose legacy aliases such as 'image2'."
+                ),
             },
             "size": {
                 "type": "string",
@@ -100,13 +106,13 @@ class OpenAIImage(BaseTool):
         return ToolStatus.UNAVAILABLE
 
     def estimate_cost(self, inputs: dict[str, Any]) -> float:
-        model = inputs.get("model", "gpt-image-1")
+        model = inputs.get("model") or os.environ.get("OPENAI_IMAGE_MODEL") or "gpt-image-2"
         quality = inputs.get("quality", "high")
         n = inputs.get("n", 1)
-        if model == "gpt-image-1":
+        if model.startswith("gpt-image"):
             cost_map = {"low": 0.011, "medium": 0.042, "high": 0.167, "auto": 0.042}
             return cost_map.get(quality, 0.042) * n
-        # dall-e-3 fallback pricing
+        # dall-e-3 / relay fallback pricing estimate
         quality_map = {"standard": 0.04, "hd": 0.08}
         return quality_map.get(quality, 0.04) * n
 
@@ -121,13 +127,17 @@ class OpenAIImage(BaseTool):
 
         start = time.time()
         client = OpenAI()
-        model = inputs.get("model", "gpt-image-1")
+        model = (
+            inputs.get("model")
+            or os.environ.get("OPENAI_IMAGE_MODEL")
+            or "gpt-image-2"
+        )
         prompt = inputs["prompt"]
         size = inputs.get("size", "1024x1024")
         n = inputs.get("n", 1)
 
         try:
-            if model == "gpt-image-1":
+            if model.startswith("gpt-image") or model in ("image2", "gpt-image"):
                 quality = inputs.get("quality", "high")
                 output_format = inputs.get("output_format", "png")
                 response = client.images.generate(
@@ -139,7 +149,7 @@ class OpenAIImage(BaseTool):
                     n=n,
                 )
             else:
-                # dall-e-3 path
+                # DALL-E 3 / legacy relay path
                 quality = inputs.get("quality", "standard")
                 if quality in ("low", "medium", "high", "auto"):
                     quality = "standard"  # map to dall-e-3 quality options
@@ -152,7 +162,20 @@ class OpenAIImage(BaseTool):
                     response_format="b64_json",
                 )
 
-            image_data = base64.b64decode(response.data[0].b64_json)
+            # Relays may return base64 OR a URL — handle both so an
+            # OpenAI-compatible relay (kuku, etc.) works without changes.
+            item = response.data[0]
+            if getattr(item, "b64_json", None):
+                image_data = base64.b64decode(item.b64_json)
+            elif getattr(item, "url", None):
+                import urllib.request
+
+                image_data = urllib.request.urlopen(item.url, timeout=60).read()
+            else:
+                return ToolResult(
+                    success=False,
+                    error="Image API returned neither b64_json nor url.",
+                )
             ext = inputs.get("output_format", "png")
             output_path = Path(inputs.get("output_path", f"generated_image.{ext}"))
             output_path.parent.mkdir(parents=True, exist_ok=True)
